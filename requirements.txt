@@ -1,4 +1,4 @@
-streamlit==1.57.0
+PyQt5==5.15.10
 pandas==3.0.2
 matplotlib==3.10.1
 seaborn==0.13.2
