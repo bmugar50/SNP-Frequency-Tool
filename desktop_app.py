@@ -1127,7 +1127,7 @@ class SNPAnalyzerApp(QMainWindow):
         results_layout.addWidget(hf_group)
 
         # All variants table
-        all_group = QGroupBox("All Variant Calls")
+        all_group = QGroupBox("Minority Variants (20%–80%)")
         all_vbox = QVBoxLayout()
         self._all_table = QTableWidget()
         self._all_table.setMinimumHeight(150)
@@ -1514,11 +1514,21 @@ class SNPAnalyzerApp(QMainWindow):
         self._fit_table(self._hf_table)
 
     def _fill_all_table(self, df):
+        minority = df[(df["Frequency"] >= 0.20) & (df["Frequency"] <= 0.80)].copy()
+        if minority.empty:
+            self._all_table.setRowCount(1)
+            self._all_table.setColumnCount(1)
+            self._all_table.setHorizontalHeaderLabels(["Result"])
+            self._all_table.setItem(0, 0, QTableWidgetItem(
+                "No minority variants (20%–80%) found — sample may be clonal or nearly identical to reference."
+            ))
+            self._fit_table(self._all_table)
+            return
         display_cols = ["Sample_ID", "Position", "Gene", "Variant_Type",
                         "Base", "Mutation_Effect", "AA_Change",
                         "Count", "Depth", "Frequency"]
-        cols = [c for c in display_cols if c in df.columns]
-        self._populate_table(self._all_table, df[cols].sort_values("Frequency", ascending=False))
+        cols = [c for c in display_cols if c in minority.columns]
+        self._populate_table(self._all_table, minority[cols].sort_values("Frequency", ascending=False))
         self._fit_table(self._all_table, max_visible=12)
 
     @staticmethod
