@@ -1,166 +1,149 @@
-# Nucleotide SNP & Variant Analyzer
+# SNP Frequency Analyzer
 
-A local desktop application for analyzing SNP and indel frequencies across any NCBI nucleotide accession and its linked sequencing samples.
+A desktop application for identifying and interpreting SNPs and indels across viral and bacterial genomes using publicly available sequencing data from NCBI SRA.
 
-## Overview
+## What it does
 
-This tool:
+1. Selects a reference genome (from 16 presets or a manual accession)
+2. Fetches linked sequencing runs from NCBI SRA
+3. Streams reads directly through alignment — nothing written to disk
+4. Calls SNP and indel frequencies using pysam pileup
+5. Annotates each variant with its gene and whether it is synonymous (silent) or non-synonymous (amino acid change)
+6. Displays results as an interactive plot and three tables
 
-- Downloads a reference sequence from NCBI using an accession ID
-- Finds linked SRA (Sequence Read Archive) sequencing samples
-- Aligns reads to the reference using minimap2
-- Computes SNP and indel frequencies across the genome
-- Displays variant counts by gene and high-frequency mutation summaries
-- **Automatically finds alternative accessions with SRA data** if the provided accession has no linked samples
+## Features
 
-## Who should use it
-
-Any researcher or analyst who wants to compare sample-level SNP and variant information for NCBI nucleotide sequences. It supports any valid NCBI accession with a FASTA and GenBank record.
-
-### What accessions work?
-
-- **Direct accessions**: Accessions with direct SRA sample links (e.g., `NC_045512.2` for SARS-CoV-2)
-- **RefSeq sequences**: Reference sequences like HIV-1 (`NC_001802.1`) are automatically mapped to available strain data
-- **Generic sequences**: Any organism sequence — the app finds related samples
+- **16 preset organisms** (SARS-CoV-2, HIV-1, Ebola, E. coli, M. tuberculosis, S. pneumoniae D39, and more) plus manual accession entry
+- **Platform auto-detection** — reads the sequencing platform (Illumina, Nanopore, PacBio) per run and applies the correct minimap2 preset automatically
+- **Streaming pipeline** — `fastq-dump --stdout | minimap2 | samtools sort` runs concurrently with no intermediate FASTQ files on disk
+- **Max reads cap** (default 500,000) — limits download per sample; reduces typical runtime to ~2 minutes for viral genomes
+- **Configurable thresholds** — minimum read depth and minimum allele frequency before a variant is reported
+- **Gene map** — fetches CDS annotations from GenBank; handles RefSeq CON records (e.g. all bacterial NC_ accessions) by falling back to the primary submission automatically
+- **Synonymous / non-synonymous classification** — for every SNP inside a coding sequence, computes the codon change and amino acid effect; handles both plus- and minus-strand genes
+- **Multi-sample** — select multiple SRA runs; results are overlaid on the same plot and combined in the tables
 
 ## Prerequisites
 
-- Python 3.10 or newer
-- `fasterq-dump`, `minimap2`, and `samtools` installed and available in your PATH
-- Internet access for NCBI and SRA
-- Valid email address (for NCBI API access)
+| Tool | Purpose |
+|------|---------|
+| Python 3.8 via conda | Runtime (see note below) |
+| `minimap2` | Read alignment |
+| `samtools` | BAM sorting |
+| `fastq-dump` (SRA Toolkit) | Read streaming from NCBI |
 
-## Install required tools
+> **macOS note:** The app uses PyQt5, which requires a Python build linked against the system Qt libraries. The conda base environment (Python 3.8) works. Python 3.10+ from a standard venv breaks the Qt plugin on macOS and will show a "cocoa platform plugin" error at launch.
 
-### macOS (Homebrew)
-```bash
-brew install sratoolkit minimap2 samtools
-```
-
-### Linux
-Use your package manager or install from project websites.
-
-## Set up the Python environment
-
-From the application folder:
+### Install bioinformatics tools (conda)
 
 ```bash
-cd /path/to/SNPApp
-python3 -m venv snp_venv
-source snp_venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+conda install -c bioconda minimap2 samtools sra-tools
 ```
 
-If `requirements.txt` is missing, install packages directly:
+### Install Python dependencies
 
 ```bash
 pip install PyQt5 pysam pandas matplotlib seaborn biopython
 ```
 
-## Run the app
+## Running the app
 
 ```bash
-cd /path/to/SNPApp
-source snp_venv/bin/activate
+# Make sure the conda environment is active (not a venv)
+deactivate 2>/dev/null; true
 python desktop_app.py
 ```
 
-## Using the app
+## Workflow
 
-### Setup
-1. Enter your email address (required for NCBI API access) and click **Update Email**.
-2. This email is used to track API requests; it can be a generic or shared email.
+### 1. Enter your NCBI email
+NCBI requires an email for Entrez API access. Enter it in the Email field and click **Update Email**. Any valid email works.
 
-### Finding & Selecting an Accession
-1. In the **"Find Accessions with Available Samples"** section:
-   - Enter an organism or keyword (e.g., `SARS-CoV-2`, `HIV`, `Influenza`, `Monkeypox`)
-   - Click **Search Accessions**
-2. The app will:
-   - Verify that sequencing samples are available
-   - Find complete genome accessions for that organism
-   - Display options with the total number of available samples
-3. **Select an accession** from the dropdown
-   - The selected accession appears in the "Selected Reference Sequence" field
+### 2. Select a reference genome
+- Choose from the **Preset Organisms** list (radio button), or
+- Switch to **Manual Accession** and type any NCBI nucleotide accession (e.g. `NC_045512.2`)
 
-### Analysis workflow
-1. Optionally adjust the **"Max Samples"** limit (default: 10)
-2. Click **Fetch Sequencing Samples**
-   - The app downloads the reference and finds matching SRA samples
-3. Select one or more samples from the list
-4. Click **Run Analysis**
-5. Review the results:
-   - Mutation profile plot
-   - SNP count by gene
-   - High-frequency variant summary (>80% frequency)
+### 3. Fetch sequencing runs
+- Set the **Max runs** limit (how many SRA runs to list)
+- Click **Fetch Runs**
+- Each checkbox shows the run ID, title, date, total bases, and detected sequencing platform
+- Runs without size data are dimmed — they are often inaccessible
 
-## Notes
+### 4. Configure analysis settings
+| Setting | Default | Notes |
+|---------|---------|-------|
+| Max reads/sample | 500,000 | Set to 0 for all reads (warns if run >500 Mbp) |
+| Min depth | 20 | Lower to 5–10 for large bacterial genomes |
+| Min frequency | 5% | Minimum allele frequency to report a variant |
 
-- **Accession Selection**: Use the "Find Accessions with Available Samples" feature to search for valid sequences. This ensures you only select accessions that have linked SRA samples.
-- The app automatically extracts the reference sequence name from the downloaded FASTA, so it works with different accessions.
-- **Complete Genomes**: The search prioritizes complete genome sequences; partial sequences are included as fallback options.
-- If a GenBank record contains CDS annotations, the SNP counts are assigned to genes; otherwise, they're labeled "Intergenic."
-- Temporary files (FASTQ, SAM, BAM) are cleaned up after processing.
+### 5. Run analysis
+Select one or more runs and click **Run Analysis**. The status bar shows live progress and estimated time remaining. Click **Abort** to cancel at any time.
 
-## Handling Sample Download Failures
+### 6. Interpret results
 
-If one or more sequencing samples fail to download:
-- The app will **automatically skip** the failed sample and continue analysis with successful ones
-- Failed samples are retried up to 3 times with exponential backoff
-- A summary message shows which samples succeeded and which failed
-- Possible reasons for failure:
-  - Sample is from DDBJ (Japan, DRR prefix) or ENA (Europe, ERR prefix) and may have temporary unavailability
-  - Network issues or NCBI downtime
-  - Sample has been removed or restricted
+**SNP / INDEL Profile plot**
+- X-axis: genome position (bp)
+- Y-axis: allele frequency (proportion of reads carrying that base)
+- Red circles = SNPs, blue squares = INDELs (shape varies by sample)
+- Dashed line at 0.8 = 80% threshold; variants above this are likely fixed in the sample
+- Gene track below the plot shows only genes that contain at least one called variant
 
-## Filtering by Sample Source
+**SNP / INDEL Count by Gene table**
+Counts of SNPs and INDELs per gene, sorted by frequency. Gives a quick view of which genes are most variable.
 
-You can filter which sample sources to include:
-- **SRR (NCBI)**: Most reliable ✓ (enabled by default)
-- **ERR (ENA Europe)**: Generally reliable ✓ (enabled by default)
-- **DRR (DDBJ Japan)**: Less reliable ⚠️ (disabled by default due to frequent availability issues)
+**High-Frequency Mutations (>80%) table**
+Variants present in >80% of reads — likely fixed differences from the reference. Includes `Mutation_Effect` and `AA_Change` for biological interpretation.
 
-To adjust filters:
-1. Use the **"Filter Sample Sources"** checkboxes after fetching samples
-2. Uncheck DRR to prevent unreliable Japanese samples
-3. The sample list updates immediately to show only selected sources
+**All Variants table**
+Every variant passing the depth and frequency thresholds, with:
 
-### Why Disable DRR?
-DDBJ samples (DRR prefix) frequently fail with "exit status 3" because:
-- Metadata is less reliable than NCBI/SRA
-- Network connectivity to DDBJ from outside Japan is slower
-- Samples may have restricted availability
+| Column | Meaning |
+|--------|---------|
+| Position | Genome position (1-based) |
+| Gene | Annotated gene name, or "Intergenic" |
+| Variant_Type | SNP or INDEL |
+| Base | Alternate base (or "Indel") |
+| Mutation_Effect | Synonymous, Non-synonymous, Stop gained, Frameshift (INDEL), Intergenic, Reference allele |
+| AA_Change | Amino acid change in single-letter code (e.g. K47R); "—" for non-coding |
+| Count | Number of reads supporting this base |
+| Depth | Total reads at this position |
+| Frequency | Count / Depth |
 
-For more reliable analysis, **disable DRR** unless you specifically need data from Japanese repositories.
+## Biological interpretation
 
-## Troubleshooting
+- **Synonymous** mutations change the DNA codon but not the amino acid — they are usually neutral and do not affect protein function
+- **Non-synonymous** mutations change the amino acid — they may affect protein structure, function, drug binding, or immune evasion
+- **Stop gained** mutations introduce a premature stop codon, likely truncating the protein
+- **Frameshift (INDEL)** mutations shift the reading frame, typically disrupting all downstream codons
+- Variants in **Intergenic** regions may affect regulatory elements but do not directly alter protein sequence
 
-- **Search returns no results**: Try a broader search term (e.g., use "SARS" instead of "SARS-CoV-2 strain XYZ").
-- **Organism not found**: Verify the organism name spelling. Use common names (e.g., "HIV", "COVID", "Flu").
-- **No samples found for selected accession**: This shouldn't happen if you used the search feature. If it does, try a different accession from the search results.
-- **Sample download failed (Exit status 3)**: The sample is unavailable. The app will skip it and continue with others. Try re-running or selecting different samples.
-- **Command not found**: Install missing command-line tools and ensure they are on PATH.
-- **Missing Python packages**: Activate the virtual environment and run `pip install -r requirements.txt`.
-- **Network issues**: Confirm internet access and NCBI availability.
-- **Email error**: Ensure you've entered a valid email format and clicked **Update Email**.
+## Tips for specific genome types
 
+| Genome type | Recommended settings |
+|-------------|---------------------|
+| Viral (~10–30 kb) | Min depth 20, Max reads 500 K, Min freq 5% |
+| Small bacterial (~2 Mb, e.g. S. pneumoniae) | Min depth 10, Max reads 1–2 M, Min freq 5% |
+| Large bacterial (~4–5 Mb, e.g. E. coli) | Min depth 5, Max reads 2 M, Min freq 5% |
+
+## Known limitations
+
+- **ERR (ENA) runs** are less reliable than SRR (NCBI) — `fastq-dump` can silently return 0 reads for some ENA accessions; prefer runs that show a file size
+- **Monkeypox (NC_063383.1)** has no genome-linked SRA runs in NCBI; organism search works but prefer SRR-prefixed results
+- **Amplicon sequencing** (e.g. Influenza SRR3165632) concentrates reads in a few regions, which may produce 0 variants in the rest of the genome
+- Minus-strand gene annotation requires the reference FASTA to be the same sequence used for alignment; custom accessions work as long as they are in NCBI Nucleotide
 
 ## File summary
 
-- `desktop_app.py` — Main application code
-- `requirements.txt` — Python dependencies
-- `packages.txt` — System dependencies for Linux environments
-- `README.md` — This file
+| File | Purpose |
+|------|---------|
+| `desktop_app.py` | Entire application |
+| `requirements.txt` | Python package list |
+| `packages.txt` | System-level dependencies (Linux) |
+| `README.md` | This file |
 
-## Recommended workflow
+## Dependencies credited
 
-Use the app locally on your machine. This avoids cloud restrictions and supports the required external bioinformatics tools (fasterq-dump, minimap2, samtools).
-
-## Citation
-
-If you use this tool in your research, please cite the underlying tools:
-- BioPython (PMID: 19304878)
-- minimap2 (PMID: 29750223)
-- SAMtools (PMID: 21320865)
-- NCBI SRA/Entrez (NCBI resource)
-
+- [BioPython](https://biopython.org/) — sequence I/O, Entrez API, codon translation (PMID: 19304878)
+- [minimap2](https://github.com/lh3/minimap2) — read alignment (PMID: 29750223)
+- [SAMtools](http://www.htslib.org/) — BAM processing (PMID: 21320865)
+- [pysam](https://pysam.readthedocs.io/) — pileup-based variant calling
+- [NCBI SRA / Entrez](https://www.ncbi.nlm.nih.gov/sra) — sequencing data source

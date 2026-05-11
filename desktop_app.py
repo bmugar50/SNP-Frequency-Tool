@@ -1,13 +1,35 @@
 import sys
 import os
 import time
+
+# Fix "Could not find Qt platform plugin cocoa" on macOS when running from a venv.
+# Must be set before any PyQt5 import.
+def _fix_qt_plugin_path():
+    try:
+        import PyQt5 as _qt
+        _base = os.path.dirname(_qt.__file__)
+        for _candidate in (
+            os.path.join(_base, "Qt5", "plugins", "platforms"),
+            os.path.join(_base, "Qt",  "plugins", "platforms"),
+        ):
+            if os.path.isdir(_candidate):
+                os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", _candidate)
+                break
+    except Exception:
+        pass
+
+_fix_qt_plugin_path()
 import pysam
 import pandas as pd
 import matplotlib.patches as mpatches
 import seaborn as sns
+import re
 import xml.etree.ElementTree as ET
+import multiprocessing
+import bisect
 from collections import OrderedDict
 from Bio import SeqIO, Entrez
+from Bio.Seq import Seq
 import subprocess
 
 from PyQt5.QtWidgets import (
@@ -15,12 +37,106 @@ from PyQt5.QtWidgets import (
     QPushButton, QLineEdit, QLabel, QTableWidget, QTableWidgetItem,
     QProgressBar, QCheckBox, QScrollArea, QFrame, QGroupBox,
     QMessageBox, QSpinBox, QRadioButton, QButtonGroup,
-    QComboBox, QSplitter, QSizePolicy, QHeaderView
+    QComboBox, QSplitter, QSizePolicy, QHeaderView, QFileDialog, QDoubleSpinBox
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt5.QtGui import QFont, QColor
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+STYLESHEET = """
+QMainWindow, QWidget {
+    background-color: #f5f6fa;
+    color: #2c3e50;
+    font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
+    font-size: 13px;
+}
+QGroupBox {
+    background-color: #ffffff;
+    border: 1px solid #dde1e7;
+    border-radius: 6px;
+    margin-top: 10px;
+    padding: 8px;
+    font-weight: 600;
+    color: #2c3e50;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+}
+QPushButton {
+    background-color: #3498db;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-weight: 500;
+}
+QPushButton:hover  { background-color: #2980b9; }
+QPushButton:pressed { background-color: #2471a3; }
+QPushButton:disabled { background-color: #bdc3c7; color: #ecf0f1; }
+QPushButton#run_btn {
+    background-color: #27ae60;
+    font-size: 13px;
+    font-weight: bold;
+    padding: 8px 20px;
+}
+QPushButton#run_btn:hover    { background-color: #229954; }
+QPushButton#run_btn:disabled { background-color: #a9cbb8; color: #ecf0f1; }
+QPushButton#abort_btn {
+    background-color: #e74c3c;
+    font-size: 13px;
+    font-weight: bold;
+    padding: 8px 20px;
+    color: white;
+}
+QPushButton#abort_btn:hover    { background-color: #c0392b; }
+QPushButton#abort_btn:disabled { background-color: #e8a9a3; color: #f9ebea; }
+QLineEdit, QComboBox, QSpinBox {
+    background-color: #ffffff;
+    border: 1px solid #ced4da;
+    border-radius: 4px;
+    padding: 5px 8px;
+    color: #2c3e50;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border-color: #3498db; }
+QProgressBar {
+    background-color: #ecf0f1;
+    border: 1px solid #dde1e7;
+    border-radius: 4px;
+    text-align: center;
+    min-height: 18px;
+    color: #2c3e50;
+}
+QProgressBar::chunk {
+    background-color: #3498db;
+    border-radius: 3px;
+}
+QTableWidget {
+    background-color: #ffffff;
+    alternate-background-color: #f4f6f8;
+    border: 1px solid #dde1e7;
+    gridline-color: #ecf0f1;
+}
+QTableWidget QHeaderView::section {
+    background-color: #2c3e50;
+    color: #ffffff;
+    padding: 6px;
+    border: none;
+    font-weight: 600;
+    font-size: 12px;
+}
+QScrollArea {
+    border: 1px solid #dde1e7;
+    border-radius: 4px;
+    background-color: #ffffff;
+}
+QCheckBox { spacing: 6px; padding: 3px 6px; }
+QCheckBox:hover { background-color: #ebf5fb; border-radius: 3px; }
+QRadioButton { spacing: 6px; }
+QSplitter::handle { background-color: #dde1e7; height: 2px; }
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +161,7 @@ PRESET_ORGANISMS = OrderedDict([
     ("S. aureus MRSA252              NC_002952.2", "NC_002952.2"),
     ("Salmonella Typhimurium LT2     NC_003197.2", "NC_003197.2"),
     ("K. pneumoniae NTUH-K2044       NC_012731.1", "NC_012731.1"),
-    ("S. pneumoniae R6               NC_003098.1", "NC_003098.1"),
+    ("S. pneumoniae D39               NC_008533.1", "NC_008533.1"),
 ])
 
 # SRR prefixes known to be reliably accessible from NCBI
@@ -65,7 +181,7 @@ ORGANISM_SEARCH_TERMS = {
     "NC_002952.2": "Staphylococcus aureus[Organism]",
     "NC_003197.2": "Salmonella enterica[Organism]",
     "NC_012731.1": "Klebsiella pneumoniae[Organism]",
-    "NC_003098.1": "Streptococcus pneumoniae[Organism]",
+    "NC_008533.1": "Streptococcus pneumoniae[Organism]",
 }
 
 # Pre-verified SRR/ERR runs — used instantly (no network call) if both searches fail.
@@ -78,6 +194,45 @@ CURATED_RUNS = {
         ("SRR1562345", "Influenza H1N1 HA sequencing"),
     ],
 }
+
+
+# Maps SRA platform strings to minimap2 -x presets and short display labels.
+PLATFORM_PRESETS = {
+    "ILLUMINA":       "sr",
+    "ION_TORRENT":    "sr",
+    "LS454":          "sr",
+    "ABI_SOLID":      "sr",
+    "BGISEQ":         "sr",
+    "DNBSEQ":         "sr",
+    "OXFORD_NANOPORE":"map-ont",
+    "PACBIO_SMRT":    "map-pb",
+}
+PLATFORM_LABELS = {
+    "ILLUMINA":       "Illumina",
+    "ION_TORRENT":    "IonTorrent",
+    "LS454":          "454",
+    "OXFORD_NANOPORE":"Nanopore",
+    "PACBIO_SMRT":    "PacBio",
+    "BGISEQ":         "BGI",
+    "DNBSEQ":         "DNB",
+}
+DEFAULT_PLATFORM = "ILLUMINA"
+
+
+def _parse_platform(exp_xml: str) -> str:
+    """Extract the SRA platform string from an ExpXml summary blob."""
+    m = re.search(r'<Platform[^>]*>\s*([A-Z_0-9]+)\s*</Platform>', exp_xml, re.I)
+    if m:
+        return m.group(1).upper()
+    # Fallback: instrument_model attribute sometimes encodes the brand
+    m2 = re.search(r'instrument_model="([^"]+)"', exp_xml, re.I)
+    if m2:
+        model = m2.group(1).upper()
+        if "NANOPORE" in model or "MINION" in model or "PROMETHION" in model:
+            return "OXFORD_NANOPORE"
+        if "PACBIO" in model or "SEQUEL" in model or "SMRT" in model:
+            return "PACBIO_SMRT"
+    return DEFAULT_PLATFORM
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +278,8 @@ class SRRFetchWorker(QThread):
         if df.empty and accession_id in CURATED_RUNS:
             self.status_updated.emit("Using curated known-good runs...")
             rows = [
-                {"SRR_ID": run_id, "Title": desc, "Date": "curated", "Bases": "N/A"}
+                {"SRR_ID": run_id, "Title": desc, "Date": "curated",
+                 "Bases": "N/A", "Platform": DEFAULT_PLATFORM}
                 for run_id, desc in CURATED_RUNS[accession_id]
             ]
             df = pd.DataFrame(rows)
@@ -163,16 +319,18 @@ class SRRFetchWorker(QThread):
                 rows = []
                 for s in summaries:
                     try:
+                        platform = _parse_platform(s.get("ExpXml", ""))
                         root = ET.fromstring(f"<root>{s['Runs']}</root>")
                         for run_el in root.findall(".//Run"):
                             acc = run_el.get("acc", "")
                             if not acc.startswith(ACCESSIBLE_PREFIXES):
                                 continue
                             rows.append({
-                                "SRR_ID": acc,
-                                "Title": s.get("Title", "No Title")[:60],
-                                "Date": s.get("CreateDate", "Unknown"),
-                                "Bases": run_el.get("total_bases", "N/A"),
+                                "SRR_ID":   acc,
+                                "Title":    s.get("Title", "No Title")[:60],
+                                "Date":     s.get("CreateDate", "Unknown"),
+                                "Bases":    run_el.get("total_bases", "N/A"),
+                                "Platform": platform,
                             })
                     except Exception:
                         continue
@@ -202,11 +360,16 @@ class AnalysisWorker(QThread):
     sample_error = pyqtSignal(str)        # non-fatal per-sample errors
     aborted = pyqtSignal()
 
-    def __init__(self, accession_id, selected_srr, email):
+    def __init__(self, accession_id, selected_srr, email, max_reads=0,
+                 platform_map=None, min_depth=20, min_freq=0.05):
         super().__init__()
         self.accession_id = accession_id
-        self.selected_srr = selected_srr
+        self.selected_srr = selected_srr        # list of SRR ID strings
         self.email = email
+        self.max_reads = max_reads
+        self.platform_map = platform_map or {}  # srr_id -> platform string
+        self.min_depth = min_depth
+        self.min_freq = min_freq
         self._start_time = None
         self._aborted = False
         self._current_proc = None          # currently running subprocess
@@ -223,16 +386,15 @@ class AnalysisWorker(QThread):
         self.progress_updated.emit(pct)
         elapsed = time.time() - self._start_time
 
-        # Use average completed-sample time for ETA once we have at least one sample
         if self._sample_times:
             avg = sum(self._sample_times) / len(self._sample_times)
             remaining_samples = len(self.selected_srr) - len(self._sample_times)
             eta_str = self._fmt_seconds(avg * remaining_samples) if remaining_samples > 0 else "almost done"
-        elif pct >= 15:
-            # Past the fast setup phase — linear estimate is more meaningful now
-            samples_elapsed = elapsed - self._setup_elapsed
-            samples_done_frac = max((pct - 15) / 75, 0.01)
-            remaining = (samples_elapsed / samples_done_frac) * (1 - samples_done_frac)
+        elif self._setup_elapsed > 0 and pct > 13:
+            # Linear interpolation over the sample phase (pct 13 → 95)
+            samples_elapsed = max(elapsed - self._setup_elapsed, 0.1)
+            frac = max(min((pct - 13) / 82, 0.99), 0.01)
+            remaining = max((samples_elapsed / frac) * (1 - frac), 0)
             eta_str = self._fmt_seconds(remaining)
         else:
             eta_str = "calculating..."
@@ -246,19 +408,37 @@ class AnalysisWorker(QThread):
         m, s = divmod(int(secs), 60)
         return f"{m}m {s:02d}s"
 
+    @staticmethod
+    def _check_tools():
+        """Return list of required CLI tools that are not on PATH."""
+        missing = []
+        for tool in ("minimap2", "samtools", "fastq-dump"):
+            r = subprocess.run(f"which {tool}", shell=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode != 0:
+                missing.append(tool)
+        return missing
+
     def _run_proc(self, cmd):
-        """Run a shell command via Popen so it can be killed on abort."""
+        """Run a shell command; capture stderr so failures produce useful messages."""
         self._current_proc = subprocess.Popen(
             cmd, shell=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
         self._current_proc.wait()
         rc = self._current_proc.returncode
+        stderr = (self._current_proc.stderr.read()
+                  .decode(errors="replace").strip()) if rc != 0 else ""
         self._current_proc = None
         if self._aborted:
             raise InterruptedError("Aborted")
         if rc != 0:
-            raise subprocess.CalledProcessError(rc, cmd)
+            short_cmd = cmd.split("|")[0].strip()[:80]
+            tail = stderr[-400:] if len(stderr) > 400 else stderr
+            raise RuntimeError(
+                f"Command failed (exit {rc}):\n  {short_cmd}"
+                + (f"\n\nTool output:\n{tail}" if tail else "")
+            )
 
     # ── main pipeline ────────────────────────────────────────────────────
 
@@ -266,8 +446,19 @@ class AnalysisWorker(QThread):
         Entrez.email = self.email
         self._start_time = time.time()
         self._setup_elapsed = 0
+        self._sample_errors = []
 
         try:
+            # Pre-flight: check all required tools are on PATH
+            missing = self._check_tools()
+            if missing:
+                self.error_occurred.emit(
+                    f"Required tools not found on PATH:\n\n  {', '.join(missing)}\n\n"
+                    "Install via conda:\n"
+                    "  conda install -c bioconda minimap2 samtools sra-tools"
+                )
+                return
+
             n = len(self.selected_srr)
 
             # 1. Download reference FASTA
@@ -285,15 +476,32 @@ class AnalysisWorker(QThread):
             self._run_proc("minimap2 -d ref.mmi ref.fasta")
             self._emit_progress(8)
 
+            # 2b. Read reference sequence for codon annotation
+            ref_record = SeqIO.read("ref.fasta", "fasta")
+            ref_seq = str(ref_record.seq)
+
             # 3. Build gene map from GenBank record
             self.status_updated.emit("[3/4] Fetching gene annotations from GenBank...")
-            gene_map = self._build_gene_map(self.accession_id)
+            gene_map, cds_map = self._build_gene_map(self.accession_id)
             n_genes = len(gene_map)
             self.status_updated.emit(f"[3/4] Found {n_genes} annotated gene{'s' if n_genes != 1 else ''}.")
             if self._aborted:
                 raise InterruptedError("Aborted")
             self._emit_progress(13)
             self._setup_elapsed = time.time() - self._start_time
+
+            # Build a sorted interval index for O(log n) gene lookup per variant.
+            # Intervals sorted by start position; bisect finds the candidate in one step.
+            _gene_intervals = sorted(
+                [(s, e, g) for g, (s, e) in gene_map.items()], key=lambda x: x[0]
+            )
+            _gene_starts = [iv[0] for iv in _gene_intervals]
+
+            def _lookup_gene(pos):
+                i = bisect.bisect_right(_gene_starts, pos) - 1
+                if i >= 0 and _gene_intervals[i][0] <= pos <= _gene_intervals[i][1]:
+                    return _gene_intervals[i][2]
+                return "Intergenic"
 
             # 4. Process each SRR sample
             self.status_updated.emit(f"[4/4] Processing {n} sample{'s' if n > 1 else ''}...")
@@ -306,39 +514,64 @@ class AnalysisWorker(QThread):
 
                 base = 13 + int(i * per_sample)
                 sample_start = time.time()
+                self._emit_progress(base + 1)  # kick ETA update before download starts
 
+                bam = f"{srr}_sorted.bam"  # pre-compute so finally can always clean up
                 try:
-                    bam = self._download_and_align(srr, i + 1, n, base, per_sample)
+                    self._download_and_align(srr, i + 1, n, base, per_sample)
                     self.status_updated.emit(f"[4/4] Sample {i+1}/{n} — calling SNP variants...")
-                    df = self._call_snps(bam, self.accession_id)
+                    df, diag = self._call_snps(bam, self.accession_id,
+                                               min_depth=self.min_depth,
+                                               min_freq=self.min_freq)
                     df["Sample_ID"] = srr
-                    df["Gene"] = df["Position"].apply(
-                        lambda x: next(
-                            (g for g, (s, e) in gene_map.items() if s <= x <= e),
-                            "Intergenic"
+                    if df.empty:
+                        mapped = diag["mapped_reads"]
+                        if mapped == 0:
+                            reason = ("0 reads mapped to the reference — "
+                                      "the sample may be from a different organism or strain")
+                        elif diag["positions_above_depth"] == 0:
+                            reason = (f"{mapped:,} reads mapped but max depth was only "
+                                      f"{diag['max_depth']}× across "
+                                      f"{diag['positions_seen']:,} positions "
+                                      f"(need ≥ {self.min_depth}× to call variants) — "
+                                      "try increasing Max reads or lowering Min depth")
+                        else:
+                            reason = (f"{mapped:,} reads mapped, "
+                                      f"{diag['positions_above_depth']:,} positions "
+                                      f"above depth threshold, but no allele frequency "
+                                      f"≥ {self.min_freq:.0%} — "
+                                      "sample may be nearly identical to the reference")
+                        msg = f"{srr}: {reason}"
+                        self._sample_errors.append(msg)
+                        self.sample_error.emit(f"Warning: {msg}")
+                    else:
+                        df["Gene"] = df["Position"].apply(_lookup_gene)
+                        df = self._annotate_variants(df, cds_map, ref_seq)
+                        n_vars = len(df)
+                        self.status_updated.emit(
+                            f"[4/4] Sample {i+1}/{n} — {n_vars} variant call{'s' if n_vars != 1 else ''} found."
                         )
-                    )
-                    n_vars = len(df)
-                    self.status_updated.emit(
-                        f"[4/4] Sample {i+1}/{n} — {n_vars} variant call{'s' if n_vars != 1 else ''} found."
-                    )
-                    master_list.append(df)
-                    for f in [bam, bam + ".bai"]:
-                        if os.path.exists(f):
-                            os.remove(f)
+                        master_list.append(df)
                 except InterruptedError:
                     raise
                 except Exception as e:
-                    self.sample_error.emit(f"Skipped {srr}: {e}")
-                    continue
+                    msg = f"{srr}: {e}"
+                    self._sample_errors.append(msg)
+                    self.sample_error.emit(f"Skipped {msg}")
+                finally:
+                    for tmp in [bam, bam + ".bai"]:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
 
                 self._sample_times.append(time.time() - sample_start)
                 self._emit_progress(min(95, base + int(per_sample)))
 
             if not master_list:
+                detail = "\n\n".join(self._sample_errors) if self._sample_errors else "No error details available."
                 self.error_occurred.emit(
-                    "No samples could be processed.\n"
-                    "Check that the selected SRR runs contain reads that align to this reference."
+                    f"No usable variant calls produced from {len(self.selected_srr)} sample(s).\n\n"
+                    f"{detail}\n\n"
+                    f"Try increasing Max reads or lowering min_depth in _call_snps."
                 )
                 return
 
@@ -363,7 +596,7 @@ class AnalysisWorker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
         finally:
-            for f in ["ref.mmi"]:
+            for f in ["ref.mmi", "ref.fasta"]:
                 if os.path.exists(f):
                     os.remove(f)
 
@@ -373,7 +606,22 @@ class AnalysisWorker(QThread):
         with Entrez.efetch(db="nucleotide", id=accession_id,
                            rettype="gb", retmode="text") as h:
             record = SeqIO.read(h, "genbank")
-        gene_map = {}
+
+        # RefSeq bacterial chromosomes are CON records with no features of their
+        # own — annotations live in the primary GenBank submission.  Parse the
+        # primary accession from the CONTIG field and re-fetch.
+        has_features = any(f.type in ("CDS", "gene") for f in record.features)
+        if not has_features:
+            contig = record.annotations.get("contig", "")
+            m = re.search(r'([A-Z]{1,2}_?\d{5,9}\.\d+)', contig)
+            if m:
+                primary = m.group(1)
+                with Entrez.efetch(db="nucleotide", id=primary,
+                                   rettype="gb", retmode="text") as h:
+                    record = SeqIO.read(h, "genbank")
+
+        gene_map = {}   # name -> (start, end)  1-based, used for region lookup
+        cds_map  = {}   # name -> {start, end, strand, codon_start}  CDS only
         for feat in record.features:
             if feat.type not in ("CDS", "gene"):
                 continue
@@ -384,66 +632,158 @@ class AnalysisWorker(QThread):
             )
             if not name:
                 continue
-            start = int(feat.location.start) + 1
-            end = int(feat.location.end)
+            start = int(feat.location.start) + 1   # 1-based inclusive
+            end   = int(feat.location.end)          # 1-based inclusive (= 0-based exclusive)
+            strand = feat.location.strand if feat.location.strand is not None else 1
             # Prefer CDS entries; avoid duplicating if gene + CDS both present
             if name not in gene_map or feat.type == "CDS":
                 gene_map[name] = (start, end)
-        return gene_map
+            if feat.type == "CDS":
+                codon_start = int(quals.get("codon_start", [1])[0])
+                cds_map[name] = {
+                    "start": start, "end": end,
+                    "strand": strand, "codon_start": codon_start,
+                }
+        return gene_map, cds_map
 
     # ── download + align ─────────────────────────────────────────────────
+
+    def _annotate_variants(self, df, cds_map, ref_seq):
+        """Add Mutation_Effect and AA_Change columns to the variant DataFrame.
+
+        For each SNP inside a CDS, extracts the affected codon from the reference
+        sequence, substitutes the alternate base (taking strand into account), and
+        translates both codons to classify the change.
+        """
+        _comp = str.maketrans("ACGTacgt", "TGCAtgca")
+
+        effects, aa_changes = [], []
+
+        for _, row in df.iterrows():
+            pos  = int(row["Position"])      # 1-based genome position
+            base = str(row["Base"])
+            vtype = row["Variant_Type"]
+            gene  = row.get("Gene", "Intergenic")
+
+            # Reference base at this genome position
+            ref_base = ref_seq[pos - 1].upper() if pos - 1 < len(ref_seq) else "N"
+
+            if ref_base == base.upper() and vtype == "SNP":
+                effects.append("Reference allele")
+                aa_changes.append("—")
+                continue
+
+            if gene == "Intergenic" or gene not in cds_map:
+                effects.append("Intergenic" if gene == "Intergenic" else "Non-coding")
+                aa_changes.append("—")
+                continue
+
+            if vtype == "INDEL":
+                effects.append("Frameshift (INDEL)")
+                aa_changes.append("—")
+                continue
+
+            cds   = cds_map[gene]
+            start = cds["start"]        # 1-based inclusive
+            end   = cds["end"]          # 1-based inclusive (= 0-based exclusive)
+            strand      = cds["strand"]
+            codon_start = cds.get("codon_start", 1)
+
+            try:
+                if strand == 1:
+                    cds_offset = (pos - start) - (codon_start - 1)
+                else:
+                    cds_offset = (end - pos) - (codon_start - 1)
+
+                if cds_offset < 0:
+                    effects.append("Non-coding")
+                    aa_changes.append("—")
+                    continue
+
+                codon_idx = cds_offset // 3
+                pos_in_codon = cds_offset % 3
+
+                if strand == 1:
+                    cs = start - 1 + (codon_start - 1) + codon_idx * 3   # 0-based
+                    ref_codon = ref_seq[cs:cs + 3].upper()
+                    alt_codon = ref_codon[:pos_in_codon] + base.upper() + ref_codon[pos_in_codon + 1:]
+                else:
+                    # Codon on the coding strand sits at the high end of the genome
+                    ge = end - (codon_start - 1) - codon_idx * 3         # 0-based exclusive
+                    ref_codon_fwd = ref_seq[ge - 3:ge].upper()
+                    ref_codon = ref_codon_fwd.translate(_comp)[::-1]
+                    alt_base_coding = base.upper().translate(_comp)
+                    alt_codon = ref_codon[:pos_in_codon] + alt_base_coding + ref_codon[pos_in_codon + 1:]
+
+                if len(ref_codon) != 3 or len(alt_codon) != 3:
+                    effects.append("Unknown")
+                    aa_changes.append("—")
+                    continue
+
+                ref_aa = str(Seq(ref_codon).translate())
+                alt_aa = str(Seq(alt_codon).translate())
+                aa_pos = codon_idx + 1
+
+                if ref_aa == alt_aa:
+                    effects.append("Synonymous")
+                    aa_changes.append(f"{ref_aa}{aa_pos}{alt_aa} (silent)")
+                elif alt_aa == "*":
+                    effects.append("Stop gained")
+                    aa_changes.append(f"{ref_aa}{aa_pos}*")
+                elif ref_aa == "*":
+                    effects.append("Stop lost")
+                    aa_changes.append(f"*{aa_pos}{alt_aa}")
+                elif aa_pos == 1 and ref_aa == "M":
+                    effects.append("Start lost")
+                    aa_changes.append(f"M1{alt_aa}")
+                else:
+                    effects.append("Non-synonymous")
+                    aa_changes.append(f"{ref_aa}{aa_pos}{alt_aa}")
+
+            except Exception:
+                effects.append("Unknown")
+                aa_changes.append("—")
+
+        out = df.copy()
+        out["Mutation_Effect"] = effects
+        out["AA_Change"]       = aa_changes
+        return out
 
     def _download_and_align(self, srr_id, sample_num, sample_total, base_pct, span):
         bam_sorted = f"{srr_id}_sorted.bam"
         prefix = f"[4/4] Sample {sample_num}/{sample_total} ({srr_id})"
-
-        # Step A — download reads (~55% of per-sample time)
-        self.status_updated.emit(f"{prefix} — downloading reads via fasterq-dump...")
-        self._run_proc(f"fasterq-dump --split-files {srr_id}")
-        self._emit_progress(base_pct + int(span * 0.55))
-
-        # Find FASTQ file(s)
-        single = f"{srr_id}.fastq"
-        r1 = f"{srr_id}_1.fastq"
-        r2 = f"{srr_id}_2.fastq"
-        if os.path.exists(single):
-            fastq_input = single
-            layout = "single-end"
-        elif os.path.exists(r1) and os.path.exists(r2):
-            fastq_input = f"{r1} {r2}"
-            layout = "paired-end"
-        elif os.path.exists(r1):
-            fastq_input = r1
-            layout = "single-end (R1 only)"
-        else:
-            raise FileNotFoundError(f"No FASTQ files found after downloading {srr_id}")
-
-        # Step B — align with minimap2 (~35% of per-sample time)
+        threads = min(multiprocessing.cpu_count(), 8)
         ref = "ref.mmi" if os.path.exists("ref.mmi") else "ref.fasta"
-        self.status_updated.emit(f"{prefix} — aligning {layout} reads with minimap2...")
-        self._run_proc(
-            f"minimap2 -a {ref} {fastq_input} | "
+
+        platform = self.platform_map.get(srr_id, DEFAULT_PLATFORM)
+        preset = PLATFORM_PRESETS.get(platform, "sr")
+        plat_label = PLATFORM_LABELS.get(platform, platform.capitalize())
+
+        reads_flag = f"-X {self.max_reads}" if self.max_reads > 0 else ""
+        cap_note = f" (capped at {self.max_reads:,} reads)" if self.max_reads > 0 else ""
+        cmd = (
+            f"fastq-dump {reads_flag} --stdout --skip-technical {srr_id} | "
+            f"minimap2 -ax {preset} -t {threads} {ref} - | "
             f"samtools view -bS -F 4 | "
             f"samtools sort -o {bam_sorted}"
         )
+
+        self.status_updated.emit(
+            f"{prefix} — streaming {plat_label} reads → align [{preset}]{cap_note}..."
+        )
+        self._run_proc(cmd)
         self._emit_progress(base_pct + int(span * 0.90))
 
-        # Step C — index BAM (~10% of per-sample time)
-        self.status_updated.emit(f"{prefix} — indexing BAM file...")
+        self.status_updated.emit(f"{prefix} — indexing BAM...")
         self._run_proc(f"samtools index {bam_sorted}")
         self._emit_progress(base_pct + int(span * 0.95))
-
-        # Clean FASTQ
-        for fq in [single, r1, r2, f"{srr_id}.sam"]:
-            if os.path.exists(fq):
-                os.remove(fq)
-
-        return bam_sorted
 
     # ── SNP calling ──────────────────────────────────────────────────────
 
     def _call_snps(self, bam_path, accession_id, min_depth=20, min_freq=0.05):
         bam = pysam.AlignmentFile(bam_path, "rb")
+
+        mapped_reads = bam.mapped  # from BAM index
 
         # Resolve reference name from BAM header
         ref_names = list(bam.references)
@@ -454,11 +794,18 @@ class AnalysisWorker(QThread):
         ref_name = matching[0] if matching else ref_names[0]
 
         results = []
+        positions_seen = 0
+        positions_above_depth = 0
+        max_depth = 0
+
         for col in bam.pileup(ref_name, min_mapping_quality=20):
-            pos = col.pos + 1
+            positions_seen += 1
             depth = col.nsegments
+            max_depth = max(max_depth, depth)
             if depth < min_depth:
                 continue
+            positions_above_depth += 1
+            pos = col.pos + 1
 
             counts = {"A": 0, "T": 0, "C": 0, "G": 0, "Indel": 0}
             for read in col.pileups:
@@ -483,7 +830,16 @@ class AnalysisWorker(QThread):
                         "Frequency": round(freq, 4),
                     })
         bam.close()
-        return pd.DataFrame(results)
+
+        diag = {
+            "mapped_reads":         mapped_reads,
+            "positions_seen":       positions_seen,
+            "positions_above_depth": positions_above_depth,
+            "max_depth":            max_depth,
+        }
+        _cols = ["Position", "Variant_Type", "Base", "Count", "Depth", "Frequency"]
+        df = pd.DataFrame(results, columns=_cols) if results else pd.DataFrame(columns=_cols)
+        return df, diag
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +855,12 @@ class SNPAnalyzerApp(QMainWindow):
         self.current_results = None
         self._worker = None
         self._fetch_worker = None
+        self._analysis_start = None
+
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._tick_elapsed)
+
         self._init_ui()
 
     # ── UI construction ──────────────────────────────────────────────────
@@ -584,7 +946,7 @@ class SNPAnalyzerApp(QMainWindow):
         top_layout.addWidget(acc_group)
 
         # SRR fetch controls
-        fetch_group = QGroupBox("SRR Sample Discovery")
+        fetch_group = QGroupBox("Sequencing Run Discovery")
         fetch_outer = QVBoxLayout()
 
         fetch_row = QHBoxLayout()
@@ -593,16 +955,30 @@ class SNPAnalyzerApp(QMainWindow):
         self._limit_spin.setRange(1, 50)
         self._limit_spin.setValue(10)
         fetch_row.addWidget(self._limit_spin)
-        self._fetch_btn = QPushButton("Fetch SRR Codes")
+        self._fetch_btn = QPushButton("Fetch Runs")
         self._fetch_btn.clicked.connect(self._fetch_srr)
         fetch_row.addWidget(self._fetch_btn)
+
+        fetch_row.addSpacing(20)
+        fetch_row.addWidget(QLabel("Max reads/sample:"))
+        self._max_reads_spin = QSpinBox()
+        self._max_reads_spin.setRange(0, 10_000_000)
+        self._max_reads_spin.setSingleStep(100_000)
+        self._max_reads_spin.setValue(500_000)
+        self._max_reads_spin.setSpecialValueText("all reads")
+        self._max_reads_spin.setToolTip(
+            "Limit reads downloaded per sample.\n"
+            "500 K is usually enough for reliable frequency estimates.\n"
+            "Set to 0 to download all reads."
+        )
+        fetch_row.addWidget(self._max_reads_spin)
         fetch_row.addStretch()
         fetch_outer.addLayout(fetch_row)
 
         # Note about DRR filtering
         note = QLabel(
-            "Note: DRR-prefixed runs (DDBJ) are excluded as they are typically inaccessible. "
-            "Only SRR and ERR runs are shown."
+            "Note: Only SRR (NCBI) and ERR (ENA) runs are shown — DRR (DDBJ) runs are excluded. "
+            "Runs without a size are dimmed and may be inaccessible."
         )
         note.setStyleSheet("color: #888; font-size: 11px;")
         note.setWordWrap(True)
@@ -651,21 +1027,50 @@ class SNPAnalyzerApp(QMainWindow):
         prog_group.setLayout(prog_layout)
         top_layout.addWidget(prog_group)
 
+        # Variant calling thresholds
+        thresh_group = QGroupBox("Variant Calling Thresholds")
+        thresh_row = QHBoxLayout()
+
+        thresh_row.addWidget(QLabel("Min depth:"))
+        self._min_depth_spin = QSpinBox()
+        self._min_depth_spin.setRange(1, 500)
+        self._min_depth_spin.setValue(20)
+        self._min_depth_spin.setToolTip(
+            "Minimum read depth at a position to call a variant.\n"
+            "Lower this (e.g. 5–10) for large bacterial genomes\n"
+            "or when using a small read cap."
+        )
+        thresh_row.addWidget(self._min_depth_spin)
+
+        thresh_row.addSpacing(16)
+        thresh_row.addWidget(QLabel("Min frequency:"))
+        self._min_freq_spin = QDoubleSpinBox()
+        self._min_freq_spin.setRange(0.01, 0.5)
+        self._min_freq_spin.setSingleStep(0.01)
+        self._min_freq_spin.setDecimals(2)
+        self._min_freq_spin.setValue(0.05)
+        self._min_freq_spin.setToolTip(
+            "Minimum allele frequency (0–1) to report a variant.\n"
+            "0.05 = 5%.  Lower for rare-variant detection."
+        )
+        thresh_row.addWidget(self._min_freq_spin)
+        thresh_row.addStretch()
+        thresh_group.setLayout(thresh_row)
+        top_layout.addWidget(thresh_group)
+
         # Run / Abort buttons
         run_row = QHBoxLayout()
         self._run_btn = QPushButton("Run Analysis")
+        self._run_btn.setObjectName("run_btn")
         self._run_btn.setEnabled(False)
         self._run_btn.setMinimumHeight(36)
-        self._run_btn.setFont(QFont("Arial", 11, QFont.Bold))
         self._run_btn.clicked.connect(self._run_analysis)
         run_row.addWidget(self._run_btn)
 
         self._abort_btn = QPushButton("Abort")
+        self._abort_btn.setObjectName("abort_btn")
         self._abort_btn.setEnabled(False)
         self._abort_btn.setMinimumHeight(36)
-        self._abort_btn.setFont(QFont("Arial", 11, QFont.Bold))
-        self._abort_btn.setStyleSheet("QPushButton { color: white; background-color: #c0392b; }"
-                                      "QPushButton:disabled { background-color: #888; }")
         self._abort_btn.clicked.connect(self._abort_analysis)
         run_row.addWidget(self._abort_btn)
         top_layout.addLayout(run_row)
@@ -685,7 +1090,7 @@ class SNPAnalyzerApp(QMainWindow):
         self._fig = Figure(figsize=(12, 5), dpi=100)
         self._canvas = FigureCanvas(self._fig)
         self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._canvas.setMinimumHeight(420)
+        self._canvas.setMinimumHeight(320)
         plot_vbox.addWidget(self._canvas)
 
         # Export button
@@ -705,7 +1110,7 @@ class SNPAnalyzerApp(QMainWindow):
         gene_group = QGroupBox("SNP / INDEL Count by Gene")
         gene_vbox = QVBoxLayout()
         self._gene_table = QTableWidget()
-        self._gene_table.setMaximumHeight(200)
+        self._gene_table.setMinimumHeight(120)
         self._gene_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         gene_vbox.addWidget(self._gene_table)
         gene_group.setLayout(gene_vbox)
@@ -715,7 +1120,7 @@ class SNPAnalyzerApp(QMainWindow):
         hf_group = QGroupBox("High-Frequency Mutations (>80%)")
         hf_vbox = QVBoxLayout()
         self._hf_table = QTableWidget()
-        self._hf_table.setMaximumHeight(200)
+        self._hf_table.setMinimumHeight(120)
         self._hf_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         hf_vbox.addWidget(self._hf_table)
         hf_group.setLayout(hf_vbox)
@@ -725,7 +1130,7 @@ class SNPAnalyzerApp(QMainWindow):
         all_group = QGroupBox("All Variant Calls")
         all_vbox = QVBoxLayout()
         self._all_table = QTableWidget()
-        self._all_table.setMaximumHeight(250)
+        self._all_table.setMinimumHeight(150)
         self._all_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         all_vbox.addWidget(self._all_table)
         all_group.setLayout(all_vbox)
@@ -735,7 +1140,7 @@ class SNPAnalyzerApp(QMainWindow):
         results_scroll.setWidget(results_inner)
         splitter.addWidget(results_scroll)
 
-        splitter.setSizes([520, 430])
+        splitter.setSizes([420, 680])
 
     # ── UI event handlers ────────────────────────────────────────────────
 
@@ -826,11 +1231,35 @@ class SNPAnalyzerApp(QMainWindow):
 
         for _, row in df.iterrows():
             srr_id = str(row["SRR_ID"])
-            title = str(row.get("Title", ""))[:60]
+            title = str(row.get("Title", ""))[:55]
             date = str(row.get("Date", ""))
-            bases = str(row.get("Bases", ""))
-            label = f"{srr_id}  |  {title}  |  {date}  |  {bases} bases"
+            platform_raw = str(row.get("Platform", DEFAULT_PLATFORM))
+            platform_label = PLATFORM_LABELS.get(platform_raw, platform_raw.capitalize())
+            raw_bases = row.get("Bases", "N/A")
+            try:
+                n = int(raw_bases)
+                if n >= 1_000_000_000:
+                    bases_str = f"{n / 1e9:.1f} Gbp"
+                elif n >= 1_000_000:
+                    bases_str = f"{n / 1e6:.1f} Mbp"
+                elif n >= 1_000:
+                    bases_str = f"{n / 1e3:.1f} Kbp"
+                else:
+                    bases_str = f"{n} bp"
+                has_size = True
+            except (ValueError, TypeError):
+                bases_str = "size unknown"
+                has_size = False
+            label = f"{srr_id}   {title}   ({date}, {bases_str}, {platform_label})"
             cb = QCheckBox(label)
+            cb.setProperty("srr_platform", platform_raw)
+            try:
+                cb.setProperty("srr_bases", int(raw_bases))
+            except (ValueError, TypeError):
+                cb.setProperty("srr_bases", -1)
+            if not has_size:
+                cb.setStyleSheet("color: #999; font-style: italic;")
+                cb.setToolTip("No size data from NCBI — this run may be inaccessible or incompletely deposited")
             self.srr_checkboxes.append(cb)
             self._srr_vbox.addWidget(cb)
 
@@ -846,10 +1275,38 @@ class SNPAnalyzerApp(QMainWindow):
             QMessageBox.warning(self, "No Accession", "Please select or enter an accession ID.")
             return
 
-        selected = [cb.text().split("|")[0].strip() for cb in self.srr_checkboxes if cb.isChecked()]
-        if not selected:
+        checked = [cb for cb in self.srr_checkboxes if cb.isChecked()]
+        if not checked:
             QMessageBox.warning(self, "No Selection", "Please select at least one SRR run.")
             return
+        selected = [cb.text().split()[0] for cb in checked]
+
+        if self._max_reads_spin.value() == 0:
+            large = [
+                cb.text().split()[0]
+                for cb in checked
+                if (cb.property("srr_bases") or -1) > 500_000_000
+            ]
+            if large:
+                names = ", ".join(large)
+                reply = QMessageBox.warning(
+                    self, "Large Run — No Read Cap",
+                    f"Max reads is set to <b>all reads</b> and the following run(s) "
+                    f"exceed 500 Mbp:<br><br><b>{names}</b><br><br>"
+                    f"This may take <b>10–30 minutes per sample</b> depending on "
+                    f"network speed and CPU.<br><br>"
+                    f"Consider setting Max reads to 500,000–1,000,000 for a faster result. "
+                    f"Continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
+        platform_map = {
+            cb.text().split()[0]: (cb.property("srr_platform") or DEFAULT_PLATFORM)
+            for cb in checked
+        }
 
         self._run_btn.setEnabled(False)
         self._abort_btn.setEnabled(True)
@@ -857,7 +1314,16 @@ class SNPAnalyzerApp(QMainWindow):
         self._progress_bar.setValue(0)
         self._status_label.setText("Starting analysis...")
 
-        self._worker = AnalysisWorker(acc, selected, self._get_email())
+        self._analysis_start = time.time()
+        self._elapsed_timer.start()
+
+        self._worker = AnalysisWorker(
+            acc, selected, self._get_email(),
+            max_reads=self._max_reads_spin.value(),
+            platform_map=platform_map,
+            min_depth=self._min_depth_spin.value(),
+            min_freq=self._min_freq_spin.value(),
+        )
         self._worker.progress_updated.connect(self._progress_bar.setValue)
         self._worker.status_updated.connect(self._status_label.setText)
         self._worker.time_updated.connect(self._update_time_labels)
@@ -875,7 +1341,9 @@ class SNPAnalyzerApp(QMainWindow):
             self._abort_btn.setText("Aborting...")
             self._worker.abort()
 
-    def _on_analysis_aborted(self):
+    def _reset_controls(self):
+        self._elapsed_timer.stop()
+        self._analysis_start = None
         self._run_btn.setEnabled(True)
         self._abort_btn.setEnabled(False)
         self._abort_btn.setText("Abort")
@@ -883,25 +1351,28 @@ class SNPAnalyzerApp(QMainWindow):
         self._elapsed_label.setText("Elapsed: —")
         self._eta_label.setText("ETA: —")
 
-    def _update_time_labels(self, elapsed, eta):
-        self._elapsed_label.setText(f"Elapsed: {elapsed}")
+    def _tick_elapsed(self):
+        if self._analysis_start is not None:
+            secs = time.time() - self._analysis_start
+            m, s = divmod(int(secs), 60)
+            self._elapsed_label.setText(f"Elapsed: {m}m {s:02d}s" if m else f"Elapsed: {s}s")
+
+    def _on_analysis_aborted(self):
+        self._reset_controls()
+
+    def _update_time_labels(self, _elapsed, eta):
+        # elapsed is driven by the 1-second QTimer; only update ETA here
         self._eta_label.setText(f"ETA: {eta}")
 
     def _on_analysis_error(self, msg):
-        self._run_btn.setEnabled(True)
-        self._abort_btn.setEnabled(False)
-        self._abort_btn.setText("Abort")
-        self._fetch_btn.setEnabled(True)
+        self._reset_controls()
         self._status_label.setText("Analysis failed.")
         QMessageBox.critical(self, "Analysis Error", msg)
 
     # ── Results display ──────────────────────────────────────────────────
 
     def _display_results(self, results):
-        self._run_btn.setEnabled(True)
-        self._abort_btn.setEnabled(False)
-        self._abort_btn.setText("Abort")
-        self._fetch_btn.setEnabled(True)
+        self._reset_controls()
         self.current_results = results
 
         master_df = results["master_df"]
@@ -932,23 +1403,37 @@ class SNPAnalyzerApp(QMainWindow):
             m = markers[i % len(markers)]
             if not snps.empty:
                 ax_snp.scatter(snps["Position"], snps["Frequency"],
-                               color=palette["SNP"], marker=m, alpha=0.55,
-                               s=25, label=f"{sample} SNP" if i == 0 else "_")
+                               color=palette["SNP"], marker=m, alpha=0.6,
+                               s=28, label=f"{sample} SNP" if i == 0 else "_")
             if not indels.empty:
                 ax_snp.scatter(indels["Position"], indels["Frequency"],
-                               color=palette["INDEL"], marker=m, alpha=0.55,
-                               s=25, label=f"{sample} INDEL" if i == 0 else "_")
+                               color=palette["INDEL"], marker=m, alpha=0.6,
+                               s=28, label=f"{sample} INDEL" if i == 0 else "_")
+
+        # Restrict gene map to genes that actually contain variants so large
+        # bacterial genomes (1000+ genes) don't flood the plot with shading.
+        variant_genes = set(df["Gene"].unique()) - {"Intergenic"}
+        plot_gene_map = (
+            {g: v for g, v in gene_map.items() if g in variant_genes}
+            if variant_genes else gene_map
+        )
 
         # Gene region shading on SNP axis
-        colors = sns.color_palette("Set2", max(len(gene_map), 1))
-        for i, (gene, (start, end)) in enumerate(gene_map.items()):
-            ax_snp.axvspan(start, end, alpha=0.07, color=colors[i % len(colors)])
+        colors = sns.color_palette("Set2", max(len(plot_gene_map), 1))
+        for i, (gene, (start, end)) in enumerate(plot_gene_map.items()):
+            ax_snp.axvspan(start, end, alpha=0.08, color=colors[i % len(colors)])
 
-        ax_snp.set_ylabel("Allele Frequency")
-        ax_snp.set_title(f"SNP / INDEL Profile — {acc}  ({len(samples)} sample(s))")
+        ax_snp.set_ylabel("Allele Frequency", fontsize=10)
+        ax_snp.set_title(f"SNP / INDEL Profile — {acc}  ({len(samples)} sample(s))",
+                         fontsize=11, fontweight="bold", pad=8)
         ax_snp.set_ylim(-0.05, 1.1)
-        ax_snp.axhline(0.8, color="grey", linestyle="--", linewidth=0.7, alpha=0.7)
+        ax_snp.axhline(0.8, color="#7f8c8d", linestyle="--", linewidth=0.8, alpha=0.8,
+                       label="80% threshold")
+        ax_snp.grid(axis="y", linestyle=":", linewidth=0.5, alpha=0.6, color="#bdc3c7")
+        ax_snp.set_axisbelow(True)
         ax_snp.tick_params(labelbottom=False)
+        ax_snp.spines["top"].set_visible(False)
+        ax_snp.spines["right"].set_visible(False)
 
         # Legend for SNP/INDEL types
         legend_handles = [
@@ -960,10 +1445,13 @@ class SNPAnalyzerApp(QMainWindow):
         # ── gene map track ──────────────────────────────────────────────
         ax_gene.set_ylim(0, 1)
         ax_gene.set_yticks([])
-        ax_gene.set_xlabel("Genome Position (bp)")
+        ax_gene.set_xlabel("Genome Position (bp)", fontsize=10)
+        ax_gene.spines["top"].set_visible(False)
+        ax_gene.spines["right"].set_visible(False)
+        ax_gene.spines["left"].set_visible(False)
 
-        if gene_map:
-            for i, (gene, (start, end)) in enumerate(gene_map.items()):
+        if plot_gene_map:
+            for i, (gene, (start, end)) in enumerate(plot_gene_map.items()):
                 color = colors[i % len(colors)]
                 rect = mpatches.FancyBboxPatch(
                     (start, 0.15), end - start, 0.70,
@@ -977,7 +1465,8 @@ class SNPAnalyzerApp(QMainWindow):
                              ha="center", va="center",
                              fontsize=6, fontweight="bold", color="white",
                              clip_on=True)
-            ax_gene.set_ylabel("Genes", fontsize=8)
+            label = "Genes (with variants)" if variant_genes else "Genes"
+            ax_gene.set_ylabel(label, fontsize=8)
         else:
             ax_gene.text(0.5, 0.5, "No gene annotations available",
                          transform=ax_gene.transAxes, ha="center", va="center",
@@ -993,6 +1482,7 @@ class SNPAnalyzerApp(QMainWindow):
             .sort_values("Count", ascending=False)
         )
         self._populate_table(self._gene_table, summary)
+        self._fit_table(self._gene_table)
 
     def _fill_hf_table(self, df):
         hf = df[df["Frequency"] > 0.8].copy()
@@ -1001,36 +1491,53 @@ class SNPAnalyzerApp(QMainWindow):
             self._hf_table.setColumnCount(1)
             self._hf_table.setHorizontalHeaderLabels(["Result"])
             self._hf_table.setItem(0, 0, QTableWidgetItem("No high-frequency mutations (>80%) found."))
+            self._fit_table(self._hf_table)
             return
+        ann_cols = [c for c in ["Mutation_Effect", "AA_Change"] if c in hf.columns]
+        group_cols = ["Position", "Gene", "Base", "Variant_Type"] + ann_cols
         summary = (
-            hf.groupby(["Position", "Gene", "Base", "Variant_Type"])
+            hf.groupby(group_cols)
             .agg(Avg_Frequency=("Frequency", "mean"), Samples=("Sample_ID", "nunique"))
             .reset_index()
             .sort_values("Avg_Frequency", ascending=False)
             .head(30)
         )
         self._populate_table(self._hf_table, summary)
+        self._fit_table(self._hf_table)
 
     def _fill_all_table(self, df):
         display_cols = ["Sample_ID", "Position", "Gene", "Variant_Type",
-                        "Base", "Count", "Depth", "Frequency"]
+                        "Base", "Mutation_Effect", "AA_Change",
+                        "Count", "Depth", "Frequency"]
         cols = [c for c in display_cols if c in df.columns]
         self._populate_table(self._all_table, df[cols].sort_values("Frequency", ascending=False))
+        self._fit_table(self._all_table, max_visible=12)
 
     @staticmethod
     def _populate_table(widget, df):
         widget.setRowCount(len(df))
         widget.setColumnCount(len(df.columns))
         widget.setHorizontalHeaderLabels(list(df.columns))
+        widget.setAlternatingRowColors(True)
+        widget.setShowGrid(True)
+        widget.verticalHeader().setDefaultSectionSize(26)
+        widget.verticalHeader().setVisible(False)
         for r, (_, row) in enumerate(df.iterrows()):
             for c, val in enumerate(row):
-                if isinstance(val, float):
-                    txt = f"{val:.4f}"
-                else:
-                    txt = str(val)
+                txt = f"{val:.4f}" if isinstance(val, float) else str(val)
                 item = QTableWidgetItem(txt)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 widget.setItem(r, c, item)
+
+    @staticmethod
+    def _fit_table(table, max_visible=8):
+        """Resize table height to show up to max_visible rows, then enable internal scroll."""
+        table.resizeRowsToContents()
+        header_h = table.horizontalHeader().height()
+        row_h = sum(table.rowHeight(r) for r in range(min(table.rowCount(), max_visible)))
+        target = header_h + row_h + 4
+        table.setMinimumHeight(target)
+        table.setMaximumHeight(target)
 
     # ── Export ───────────────────────────────────────────────────────────
 
@@ -1038,7 +1545,6 @@ class SNPAnalyzerApp(QMainWindow):
         if self.current_results is None:
             QMessageBox.warning(self, "No Results", "Run an analysis first.")
             return
-        from PyQt5.QtWidgets import QFileDialog
         path, _ = QFileDialog.getSaveFileName(self, "Save Plot", "snp_plot.png",
                                               "PNG Images (*.png)")
         if path:
@@ -1049,7 +1555,6 @@ class SNPAnalyzerApp(QMainWindow):
         if self.current_results is None:
             QMessageBox.warning(self, "No Results", "Run an analysis first.")
             return
-        from PyQt5.QtWidgets import QFileDialog
         path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "snp_results.csv",
                                               "CSV Files (*.csv)")
         if path:
@@ -1061,6 +1566,7 @@ class SNPAnalyzerApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(STYLESHEET)
     window = SNPAnalyzerApp()
     window.show()
     sys.exit(app.exec_())
