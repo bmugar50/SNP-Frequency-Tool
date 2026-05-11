@@ -1379,10 +1379,18 @@ class SNPAnalyzerApp(QMainWindow):
         gene_map = results["gene_map"]
         acc = results["accession_id"]
 
-        self._draw_plot(master_df, gene_map, acc)
-        self._fill_gene_table(master_df)
-        self._fill_hf_table(master_df)
-        self._fill_all_table(master_df)
+        # Exclude reference alleles from display — they are not mutations and
+        # add noise to every table. Full data is still available via CSV export.
+        variants_df = (
+            master_df[master_df["Mutation_Effect"] != "Reference allele"]
+            if "Mutation_Effect" in master_df.columns
+            else master_df
+        )
+
+        self._draw_plot(variants_df, gene_map, acc)
+        self._fill_gene_table(variants_df)
+        self._fill_hf_table(variants_df)
+        self._fill_all_table(variants_df)
 
     def _draw_plot(self, df, gene_map, acc):
         self._fig.clear()
