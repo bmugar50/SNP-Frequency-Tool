@@ -27,7 +27,6 @@ import re
 import xml.etree.ElementTree as ET
 import multiprocessing
 import bisect
-from collections import OrderedDict
 from Bio import SeqIO, Entrez
 from Bio.Seq import Seq
 import subprocess
@@ -36,8 +35,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QTableWidget, QTableWidgetItem,
     QProgressBar, QCheckBox, QScrollArea, QFrame, QGroupBox,
-    QMessageBox, QSpinBox, QRadioButton, QButtonGroup,
-    QComboBox, QSplitter, QSizePolicy, QHeaderView, QFileDialog, QDoubleSpinBox
+    QMessageBox, QSpinBox, QComboBox, QSplitter, QSizePolicy,
+    QHeaderView, QFileDialog, QDoubleSpinBox
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt5.QtGui import QFont, QColor
@@ -134,66 +133,17 @@ QScrollArea {
 }
 QCheckBox { spacing: 6px; padding: 3px 6px; }
 QCheckBox:hover { background-color: #ebf5fb; border-radius: 3px; }
-QRadioButton { spacing: 6px; }
 QSplitter::handle { background-color: #dde1e7; height: 2px; }
 """
 
 
 # ---------------------------------------------------------------------------
-# Preset organisms: display label -> NCBI accession
-# ---------------------------------------------------------------------------
-PRESET_ORGANISMS = OrderedDict([
-    ("-- Select Organism --", ""),
-    # ── Viruses ──────────────────────────────────────────────────────────
-    ("SARS-CoV-2 (COVID-19)          NC_045512.2", "NC_045512.2"),
-    ("Influenza A H1N1 2009 (HA seg) NC_026431.1", "NC_026431.1"),
-    ("HIV-1                          NC_001802.1", "NC_001802.1"),
-    ("Ebola virus (Zaire)            NC_002549.1", "NC_002549.1"),
-    ("Dengue virus 1                 NC_001477.1", "NC_001477.1"),
-    ("Hepatitis B virus              NC_003977.2", "NC_003977.2"),
-    ("Hepatitis C virus              NC_004102.1", "NC_004102.1"),
-    ("Measles virus                  NC_001498.1", "NC_001498.1"),
-    ("Monkeypox virus                NC_063383.1", "NC_063383.1"),
-    ("Norovirus GI                   NC_001959.1", "NC_001959.1"),
-    # ── Bacteria ─────────────────────────────────────────────────────────
-    ("E. coli K-12 MG1655            NC_000913.3", "NC_000913.3"),
-    ("M. tuberculosis H37Rv          NC_000962.3", "NC_000962.3"),
-    ("S. aureus MRSA252              NC_002952.2", "NC_002952.2"),
-    ("Salmonella Typhimurium LT2     NC_003197.2", "NC_003197.2"),
-    ("K. pneumoniae NTUH-K2044       NC_012731.1", "NC_012731.1"),
-    ("S. pneumoniae D39               NC_008533.1", "NC_008533.1"),
-])
+REFERENCE_ACCESSION = "NC_045512.2"
+REFERENCE_LABEL     = "SARS-CoV-2 (COVID-19) — Wuhan-Hu-1"
+REFERENCE_GENOME_BP = "29,903 bp"
 
 # SRR prefixes known to be reliably accessible from NCBI
 ACCESSIBLE_PREFIXES = ("SRR", "ERR")
-
-# Fallback organism-name search terms — tried only when accession[Genome] returns nothing.
-# Verified 2025-05 against NCBI SRA. NC_026431.1 (Influenza HA segment) intentionally
-# omitted — organism search returns nothing for individual segments; use curated list.
-ORGANISM_SEARCH_TERMS = {
-    "NC_001802.1": "Human immunodeficiency virus 1[Organism]",
-    "NC_002549.1": "Zaire ebolavirus[Organism]",
-    "NC_001477.1": "Dengue virus 1[Organism]",
-    "NC_004102.1": "Hepatitis C virus[Organism]",
-    "NC_001498.1": "Measles morbillivirus[Organism]",
-    "NC_063383.1": "Monkeypox virus[Organism]",
-    "NC_001959.1": "Norovirus[Organism]",
-    "NC_002952.2": "Staphylococcus aureus[Organism]",
-    "NC_003197.2": "Salmonella enterica[Organism]",
-    "NC_012731.1": "Klebsiella pneumoniae[Organism]",
-    "NC_008533.1": "Streptococcus pneumoniae[Organism]",
-}
-
-# Pre-verified SRR/ERR runs — used instantly (no network call) if both searches fail.
-# Influenza H1N1 always uses this list since the segment accession can't be found
-# via organism search. All other entries are last-resort fallbacks.
-CURATED_RUNS = {
-    "NC_026431.1": [
-        ("SRR1048819", "Influenza H1N1 2009 pandemic"),
-        ("SRR3165632", "Influenza H1N1 amplicon"),
-        ("SRR1562345", "Influenza H1N1 HA sequencing"),
-    ],
-}
 
 
 # Maps SRA platform strings to minimap2 -x presets and short display labels.
@@ -258,32 +208,11 @@ class SRRFetchWorker(QThread):
             self.error_occurred.emit(str(e))
 
     def _fetch_sra_runs(self, accession_id, limit=10, retries=3):
-        # 1. Try primary search: accession linked as reference genome
         df = self._search_ncbi(f"{accession_id}[Genome]", limit, retries)
-
-        # 2. If empty, find an organism-name search term
         if df.empty:
-            if accession_id in ORGANISM_SEARCH_TERMS:
-                # Preset organism — use pre-verified term (no extra API call)
-                org_term = ORGANISM_SEARCH_TERMS[accession_id]
-            else:
-                # Manual accession — derive organism name from GenBank record
-                org_term = self._organism_term_from_genbank(accession_id)
-
-            if org_term:
-                self.status_updated.emit("No genome-linked runs — trying organism search...")
-                df = self._search_ncbi(org_term, limit, retries)
-
-        # 3. If still empty, use curated list instantly (no network call)
-        if df.empty and accession_id in CURATED_RUNS:
-            self.status_updated.emit("Using curated known-good runs...")
-            rows = [
-                {"SRR_ID": run_id, "Title": desc, "Date": "curated",
-                 "Bases": "N/A", "Platform": DEFAULT_PLATFORM}
-                for run_id, desc in CURATED_RUNS[accession_id]
-            ]
-            df = pd.DataFrame(rows)
-
+            self.status_updated.emit("No genome-linked runs found — trying organism search...")
+            df = self._search_ncbi("Severe acute respiratory syndrome coronavirus 2[Organism]",
+                                   limit, retries)
         return df
 
     def _organism_term_from_genbank(self, accession_id):
@@ -848,7 +777,7 @@ class AnalysisWorker(QThread):
 class SNPAnalyzerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SNP Frequency Analyzer")
+        self.setWindowTitle("SARS-CoV-2 SNP Frequency Analyzer")
         self.setGeometry(100, 100, 1300, 950)
         self.df_candidates = pd.DataFrame()
         self.srr_checkboxes = []
@@ -891,57 +820,21 @@ class SNPAnalyzerApp(QMainWindow):
         top_layout.addWidget(email_group)
 
         # Accession input group
-        acc_group = QGroupBox("Reference Accession")
+        acc_group = QGroupBox("Reference Genome")
         acc_outer = QVBoxLayout()
-
-        # Mode selector
-        mode_row = QHBoxLayout()
-        self._mode_group = QButtonGroup()
-        self._rb_preset = QRadioButton("Select from preset organisms")
-        self._rb_manual = QRadioButton("Enter accession manually")
-        self._rb_preset.setChecked(True)
-        self._mode_group.addButton(self._rb_preset, 0)
-        self._mode_group.addButton(self._rb_manual, 1)
-        mode_row.addWidget(self._rb_preset)
-        mode_row.addWidget(self._rb_manual)
-        mode_row.addStretch()
-        acc_outer.addLayout(mode_row)
-
-        # Preset dropdown
-        self._preset_widget = QWidget()
-        preset_row = QHBoxLayout(self._preset_widget)
-        preset_row.setContentsMargins(0, 0, 0, 0)
-        self._organism_combo = QComboBox()
-        self._organism_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for label in PRESET_ORGANISMS:
-            self._organism_combo.addItem(label)
-        self._organism_combo.currentIndexChanged.connect(self._on_preset_changed)
-        preset_row.addWidget(QLabel("Organism:"))
-        preset_row.addWidget(self._organism_combo)
-        acc_outer.addWidget(self._preset_widget)
-
-        # Manual input
-        self._manual_widget = QWidget()
-        manual_row = QHBoxLayout(self._manual_widget)
-        manual_row.setContentsMargins(0, 0, 0, 0)
-        self._manual_input = QLineEdit()
-        self._manual_input.setPlaceholderText("e.g. NC_045512.2")
-        manual_row.addWidget(QLabel("Accession ID:"))
-        manual_row.addWidget(self._manual_input)
-        self._manual_widget.setVisible(False)
-        acc_outer.addWidget(self._manual_widget)
-
-        self._mode_group.buttonClicked.connect(self._on_mode_changed)
-
-        # Resolved accession display
-        resolved_row = QHBoxLayout()
-        resolved_row.addWidget(QLabel("Resolved accession:"))
-        self._resolved_label = QLabel("—")
-        self._resolved_label.setFont(QFont("Monospace", 10))
-        resolved_row.addWidget(self._resolved_label)
-        resolved_row.addStretch()
-        acc_outer.addLayout(resolved_row)
-
+        acc_row = QHBoxLayout()
+        org_label = QLabel(f"<b>{REFERENCE_LABEL}</b>")
+        acc_label = QLabel(REFERENCE_ACCESSION)
+        acc_label.setFont(QFont("Monospace", 10))
+        bp_label = QLabel(f"({REFERENCE_GENOME_BP})")
+        bp_label.setStyleSheet("color: #666;")
+        acc_row.addWidget(org_label)
+        acc_row.addSpacing(12)
+        acc_row.addWidget(acc_label)
+        acc_row.addSpacing(8)
+        acc_row.addWidget(bp_label)
+        acc_row.addStretch()
+        acc_outer.addLayout(acc_row)
         acc_group.setLayout(acc_outer)
         top_layout.addWidget(acc_group)
 
@@ -1144,25 +1037,8 @@ class SNPAnalyzerApp(QMainWindow):
 
     # ── UI event handlers ────────────────────────────────────────────────
 
-    def _on_mode_changed(self, btn):
-        is_preset = self._mode_group.checkedId() == 0
-        self._preset_widget.setVisible(is_preset)
-        self._manual_widget.setVisible(not is_preset)
-        if is_preset:
-            self._on_preset_changed()
-        else:
-            self._resolved_label.setText("—")
-
-    def _on_preset_changed(self):
-        label = self._organism_combo.currentText()
-        acc = PRESET_ORGANISMS.get(label, "")
-        self._resolved_label.setText(acc if acc else "—")
-
     def _get_accession(self):
-        if self._mode_group.checkedId() == 0:
-            label = self._organism_combo.currentText()
-            return PRESET_ORGANISMS.get(label, "").strip()
-        return self._manual_input.text().strip()
+        return REFERENCE_ACCESSION
 
     def _get_email(self):
         return self.email_input.text().strip()
