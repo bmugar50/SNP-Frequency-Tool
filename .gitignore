@@ -21,5 +21,8 @@ venv/
 # fasterq-dump temp directories
 fasterq.tmp*/
 
+# Editor settings
+.vscode/
+
 # macOS
 .DS_Store
