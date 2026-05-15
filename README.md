@@ -1,192 +1,121 @@
 # SARS-CoV-2 SNP Frequency Analyzer
 
-A desktop application for identifying and interpreting SNPs and indels across SARS-CoV-2 sequencing samples from NCBI SRA, using the Wuhan-Hu-1 reference genome (NC_045512.2) as the baseline.
+A bioinformatics tool that downloads real SARS-CoV-2 sequencing data from NCBI, aligns it to the Wuhan-Hu-1 reference genome, and calculates how frequently each mutation appears — identifying which viral proteins are affected and whether the mutation changes the protein sequence.
 
-## Purpose
+---
 
-This tool parses FASTQ sequencing data to calculate mutation frequencies across the SARS-CoV-2 genome and interprets their biological significance — identifying whether each mutation is synonymous (silent) or non-synonymous (amino acid change), and which viral protein it affects. Comparing multiple samples reveals which mutations are conserved across strains and which are unique to individual samples.
+## Background
+
+**SNPs (Single Nucleotide Polymorphisms)** are positions in the genome where a single DNA base differs from the reference. For example, at position 23,403 in SARS-CoV-2, an A→G change produces the D614G mutation in the spike protein — a change that made the virus significantly more transmissible.
+
+**Indels** are insertions or deletions of one or more bases. Even a single base deletion shifts the entire reading frame downstream, typically disrupting the protein completely.
+
+**Allele frequency** is the proportion of sequencing reads that carry a particular base at a position. A frequency of 0.95 means 95% of reads show that base — the mutation is effectively fixed in the sample. A frequency of 0.30 means only 30% of reads carry it, suggesting a mixed population or within-host variation.
+
+---
 
 ## What it does
 
-1. Fetches SARS-CoV-2 sequencing runs from NCBI SRA linked to NC_045512.2
-2. Streams reads directly through alignment — nothing written to disk
-3. Calls SNP and indel frequencies using pysam pileup against the Wuhan-Hu-1 reference
-4. Annotates each variant with its gene (S, N, ORF1ab, etc.) and amino acid effect
+1. Fetches SARS-CoV-2 sequencing runs from NCBI SRA (linked to NC_045512.2)
+2. Streams reads through alignment with no intermediate files written to disk
+3. Calculates SNP and indel frequencies at every position using pysam pileup
+4. Annotates each variant with its gene and whether it is **synonymous** (amino acid unchanged — silent) or **non-synonymous** (amino acid changed — potentially affects protein function)
 5. Displays results as a frequency plot and three tables
 
-## Why SARS-CoV-2
+**The tool is designed for multiple samples.** Selecting runs from different variants of concern (Alpha, Delta, Omicron) lets you see which mutations are conserved across strains and which are unique to one sample — this is where the comparison becomes biologically meaningful.
 
-- **Largest public dataset** — thousands of SRA runs from patients, time points, and variants of concern (Alpha, Delta, Omicron)
-- **Small genome (29,903 bp)** — fast runtimes; 3–5 samples run in minutes
-- **Well-annotated genes** — every mutation maps to a known protein with understood function
-- **Known mutations with documented significance** — spike protein mutations like D614G, N501Y, and E484K are in the literature and directly relatable to immune evasion and vaccine escape
-- **Ideal for comparison** — selecting samples from different variants of concern shows how the virus evolved across the pandemic
-
-## Features
-
-- **Streaming pipeline** — `fastq-dump --stdout | minimap2 | samtools sort` runs concurrently with no intermediate FASTQ files on disk
-- **Platform auto-detection** — reads the sequencing platform (Illumina, Nanopore, PacBio) per run and applies the correct minimap2 preset automatically
-- **Max reads cap** (default 500,000) — limits download per sample; reduces typical runtime to ~2 minutes
-- **Configurable thresholds** — minimum read depth and minimum allele frequency
-- **Synonymous / non-synonymous classification** — for every SNP inside a coding sequence, computes the codon change and amino acid effect on both plus- and minus-strand genes
-- **Multi-sample** — select multiple SRA runs; results are overlaid on the same plot and combined in the tables
+---
 
 ## Prerequisites
 
-| Tool | Purpose |
-|------|---------|
-| Python 3.8 via conda | Runtime (see note below) |
-| `minimap2` | Read alignment |
-| `samtools` | BAM sorting |
-| `fastq-dump` (SRA Toolkit) | Read streaming from NCBI |
-
-> **macOS note:** The app uses PyQt5, which requires a Python build linked against the system Qt libraries. The conda base environment (Python 3.8) works. Python 3.10+ from a standard venv breaks the Qt plugin on macOS and will show a "cocoa platform plugin" error at launch.
-
-### Install bioinformatics tools (conda)
+| Tool | Install via |
+|------|------------|
+| Python 3.8 (conda) | `conda` — do not use a standard venv on macOS |
+| `minimap2` | `conda install -c bioconda minimap2` |
+| `samtools` | `conda install -c bioconda samtools` |
+| `fastq-dump` | `conda install -c bioconda sra-tools` |
 
 ```bash
+# Install all bioinformatics tools at once
 conda install -c bioconda minimap2 samtools sra-tools
-```
 
-### Install Python dependencies
-
-```bash
+# Install Python dependencies
 pip install PyQt5 pysam pandas matplotlib seaborn biopython
 ```
 
-## Running the app
+## Running
 
 ```bash
-# Make sure the conda environment is active (not a venv)
-deactivate 2>/dev/null; true
 python desktop_app.py
 ```
 
+---
+
 ## Workflow
 
-### 1. Enter your NCBI email
-NCBI requires an email for Entrez API access. Enter it in the Email field and click **Update Email**. Any valid email works.
+1. **Enter your NCBI email** — required for Entrez API access
+2. **Fetch Runs** — retrieves sequencing runs linked to the SARS-CoV-2 reference; prefer SRR-prefixed runs (NCBI) over ERR (ENA)
+3. **Select 3–5 samples** from different patients or variant backgrounds for meaningful comparison
+4. **Run Analysis** — streams, aligns, and calls variants; takes ~2 minutes per sample
 
-### 2. Fetch sequencing runs
-- Set the **Max results** limit (how many SRA runs to list, default 10)
-- Click **Fetch Runs**
-- Each checkbox shows the run ID, title, date, total bases, and sequencing platform
-- Runs without size data are dimmed — they are often inaccessible
-- For best results, prefer **SRR-prefixed** runs (NCBI) over ERR (ENA)
+---
 
-### 3. Configure analysis settings
+## Results
 
-| Setting | Default | Notes |
-|---------|---------|-------|
-| Max reads/sample | 500,000 | Set to 0 for all reads (warns if run >500 Mbp) |
-| Min depth | 20 | Minimum reads at a position to call a variant |
-| Min frequency | 5% | Minimum allele frequency to report a variant |
+### SNP / INDEL Profile Plot
+Shows where mutations fall across the 29,903 bp genome and how frequently they appear. Each sample gets a different marker shape so shared vs unique mutations are immediately visible. The gene track below highlights only genes with called variants. The dashed line at 80% separates fixed mutations from minority variants.
 
-### 4. Select samples — more is better
+### Fixed Mutations (>80%)
+Mutations present in more than 80% of reads — effectively fixed in that sample relative to Wuhan-Hu-1. These are the defining characteristics of a strain. The `Samples` column shows how many of your selected runs carry each mutation; a mutation seen in all samples is a reliable strain marker.
 
-The app is designed for **multiple samples**. Selecting runs from different variants of concern (e.g. Alpha, Delta, Omicron) makes every part of the output more informative:
+### Minority Variants (20–80%)
+Mutations present in 20–80% of reads, indicating a mixed population — possibly co-infection, within-host evolution, or a variant emerging under selection. Variants below 20% are excluded from display as they are indistinguishable from sequencing error at typical coverage.
 
-- The **plot** overlays each sample with a different marker so you can see which mutations are shared vs unique
-- The **Fixed Mutations table** `Samples` column shows how many runs carry each mutation — a mutation in 5/5 samples is a reliable strain marker; one in 1/5 may be noise
-- **Minority variants** appearing at the same position across independent samples are strong evidence they are real rather than sequencing artefacts
+### SNP / INDEL Count by Gene
+A summary of how many mutations fall in each viral gene across all samples. High counts in the spike (S) gene are characteristic of variants of concern.
 
-**Recommended:** select 3–5 samples from different patients or variant backgrounds.
+---
 
-### 5. Run analysis
-Click **Run Analysis**. The status bar shows live progress and estimated time remaining. Click **Abort** to cancel at any time.
+## Mutation effects explained
 
-### 6. Interpret results
-
-#### SNP / INDEL Profile plot
-- X-axis: genome position (bp) across the 29,903 bp SARS-CoV-2 genome
-- Y-axis: allele frequency (proportion of reads carrying that base)
-- Red = SNPs, blue = INDELs; marker shape varies per sample
-- Dashed line at 0.8 = 80% threshold — variants above this are effectively fixed
-- Gene track below shows only SARS-CoV-2 genes containing called variants (S, N, M, E, ORF1ab, etc.)
-
-#### SNP / INDEL Count by Gene
-Overview of which viral genes carry the most mutations across all selected samples. High counts in the spike (S) gene are typical of variants of concern.
-
-#### Fixed Mutations (>80%)
-
-Mutations present in more than 80% of reads — effectively fixed in the sample and likely defining characteristics of that variant relative to Wuhan-Hu-1.
-
-| Column | Meaning |
+| Effect | Meaning |
 |--------|---------|
-| Position | Genome position (1-based) |
-| Gene | Viral gene (S, N, ORF1ab, etc.) or Intergenic |
-| Base | Alternate nucleotide |
-| Variant_Type | SNP or INDEL |
-| Mutation_Effect | Biological effect (see table below) |
-| AA_Change | Amino acid change e.g. D614G, N501Y; "—" for non-coding |
-| Avg_Frequency | Mean frequency across all samples carrying this mutation |
-| Samples | Number of selected samples in which this mutation was found |
+| **Synonymous** | DNA changed but amino acid unchanged — silent, no effect on protein |
+| **Non-synonymous** | Amino acid changed — may affect protein folding, antibody binding, or drug susceptibility |
+| **Stop gained** | Premature stop codon introduced — truncates the protein |
+| **Frameshift (INDEL)** | Reading frame shifted — disrupts all codons downstream |
+| **Intergenic** | Falls outside any annotated gene |
 
-`Avg_Frequency` is averaged across samples. `Samples` tells you how consistent the mutation is — high frequency across many samples indicates a conserved variant-defining change.
+---
 
-#### Minority Variants (20%–80%)
+## Notable SARS-CoV-2 mutations
 
-Mutations present in 20–80% of reads. These represent within-sample diversity — mixed infection, intra-host evolution, or quasi-species dynamics. Variants below 20% are excluded from display (indistinguishable from sequencing error at typical coverage) but are included in the CSV export.
+| Mutation | Gene | Associated with |
+|----------|------|----------------|
+| D614G | Spike | Increased transmissibility — dominant globally from mid-2020 |
+| N501Y | Spike | Increased ACE2 binding — Alpha, Beta, Gamma, Omicron |
+| E484K | Spike | Reduced antibody neutralisation — Beta, Gamma |
+| K417N | Spike | Immune evasion — Beta, Omicron |
+| P681H/R | Spike | Enhanced cell entry via furin cleavage site — Alpha, Delta |
 
-| Column | Meaning |
-|--------|---------|
-| Sample_ID | The SRR run this variant was found in |
-| Position | Genome position (1-based) |
-| Gene | Viral gene or Intergenic |
-| Variant_Type | SNP or INDEL |
-| Base | Alternate nucleotide |
-| Mutation_Effect | Biological effect |
-| AA_Change | Amino acid change e.g. E484K; "—" for non-coding |
-| Count | Reads supporting this base |
-| Depth | Total reads at this position |
-| Frequency | Count / Depth — raw per-sample value, not averaged |
+If your analysis calls any of these, the `AA_Change` column will show the exact notation (e.g. `D614G`) and `Mutation_Effect` will confirm it as non-synonymous.
 
-## Biological interpretation
-
-| Mutation_Effect | Meaning |
-|-----------------|---------|
-| **Synonymous** | Codon changed but amino acid unchanged — silent, no effect on protein sequence |
-| **Non-synonymous** | Amino acid changed — may affect protein structure, antibody binding, or drug susceptibility |
-| **Stop gained** | Premature stop codon — likely truncates the viral protein |
-| **Stop lost** | Stop codon mutated — protein may extend beyond its normal terminus |
-| **Start lost** | Start codon disrupted — protein may not be translated |
-| **Frameshift (INDEL)** | Reading frame shifted — disrupts all downstream codons |
-| **Intergenic** | Outside any annotated gene — may affect regulatory elements |
-
-### Notable SARS-CoV-2 mutations to look for
-
-| Mutation | Gene | Effect | Associated with |
-|----------|------|--------|----------------|
-| D614G | S | Non-synonymous | Increased transmissibility, dominant globally from mid-2020 |
-| N501Y | S | Non-synonymous | Increased ACE2 binding; Alpha, Beta, Gamma, Omicron |
-| E484K | S | Non-synonymous | Immune evasion, reduced antibody neutralisation; Beta, Gamma |
-| K417N | S | Non-synonymous | Immune evasion; Beta, Omicron |
-| P681H/R | S | Non-synonymous | Furin cleavage site; increased cell entry; Alpha, Delta |
-| del69-70 | S | Frameshift | Spike deletion; Alpha, Omicron |
+---
 
 ## Known limitations
 
-- **ERR (ENA) runs** are less reliable than SRR (NCBI) — `fastq-dump` can silently return 0 reads for some ENA accessions; prefer runs that show a file size
-- **Amplicon sequencing** concentrates reads in specific regions and may produce 0 variants elsewhere — whole-genome sequencing runs give the most complete profile
-- **Single sample** — the app works with one sample but comparison features only become meaningful with two or more
-- **500 K read cap** is sufficient for reliable frequency estimates on the 30 kb genome; raising it increases runtime without significantly improving results for most samples
+- ERR (ENA) runs can silently return 0 reads — prefer SRR runs with a listed file size
+- Amplicon sequencing data concentrates reads in specific regions and may miss variants elsewhere; whole-genome sequencing runs give the most complete profile
+- The 500K read cap is sufficient for the 30kb SARS-CoV-2 genome; raising it increases runtime without meaningfully improving results
 
-## File summary
+---
 
-| File | Purpose |
-|------|---------|
-| `desktop_app.py` | Entire application |
-| `requirements.txt` | Python package list |
-| `packages.txt` | System-level dependencies (Linux) |
-| `install_and_run.sh` | Installs dependencies and launches the app |
-| `README.md` | This file |
-
-> A multi-organism version supporting 16 viral and bacterial presets is preserved on the `multi-organism` branch.
-
-## Dependencies credited
+## Dependencies
 
 - [BioPython](https://biopython.org/) — sequence I/O, Entrez API, codon translation (PMID: 19304878)
 - [minimap2](https://github.com/lh3/minimap2) — read alignment (PMID: 29750223)
 - [SAMtools](http://www.htslib.org/) — BAM processing (PMID: 21320865)
 - [pysam](https://pysam.readthedocs.io/) — pileup-based variant calling
-- [NCBI SRA / Entrez](https://www.ncbi.nlm.nih.gov/sra) — sequencing data source
+- [NCBI SRA](https://www.ncbi.nlm.nih.gov/sra) — sequencing data source
+
+> A multi-organism version supporting 16 viral and bacterial presets is available on the `multi-organism` branch.
