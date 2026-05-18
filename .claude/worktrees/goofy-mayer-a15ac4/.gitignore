@@ -1,0 +1,28 @@
+# Analysis output files — generated at runtime, never committed
+*.bam
+*.bam.bai
+*.mmi
+*.fastq
+*.fq
+*.sam
+ref.fasta
+ref.mmi
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv*/
+snp_venv/
+venv/
+
+# fasterq-dump temp directories
+fasterq.tmp*/
+
+# Editor settings
+.vscode/
+
+# macOS
+.DS_Store
